@@ -82,19 +82,31 @@ module MCollective
             end
 
             def runonce
+                extraopts = ''
+                if request[:tags]
+                  extraopts << " --tags #{request[:tags]}"
+                end
+
+                case request[:noop] 
+                when "true"
+                  extraopts << " --noop"
+                when "false"
+                  extraopts << " --no-noop"
+                end
                 if File.exists?(@lockfile)
                     reply.fail "Lock file exists, puppetd is already running or it's disabled"
                 else
                     if request[:forcerun]
-                        reply[:output] = %x[#{@puppetd} --onetime]
+                        reply[:output] = %x[#{@puppetd} --onetime #{extraopts}]
 
                     elsif @splaytime > 0
-                        reply[:output] = %x[#{@puppetd} --onetime --splaylimit #{@splaytime} --splay]
+                        reply[:output] = %x[#{@puppetd} --onetime --splaylimit #{@splaytime} --splay #{extraopts}]
 
                     else
-                        reply[:output] = %x[#{@puppetd} --onetime]
+                        reply[:output] = %x[#{@puppetd} --onetime #{extraopts}]
                     end
                 end
+                
             end
 
             def enable
