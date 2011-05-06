@@ -45,7 +45,18 @@ action "runonce", :description => "Initiates a single Puppet run" do
     #    :validation  => '^.+$',
     #    :optional    => true,
     #    :maxlength   => 5
-
+    input :noop,
+         :prompt      => "Run in noop mode",
+         :description => "Should puppet run in noop mode",
+         :type        => :boolean,
+         :optional    => true
+    input :tags,
+         :prompt      => "Specify tags to pass to puppetd",
+         :description => "Carry out the puppet run with specific tags",
+         :type        => :string,
+         :validation  => '^.+$',
+         :optional    => true,
+         :maxlength   => 160
     output :output,
            :description => "Output from puppetd",
            :display_as => "Output"
