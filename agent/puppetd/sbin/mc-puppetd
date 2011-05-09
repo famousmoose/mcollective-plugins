@@ -9,6 +9,7 @@ require 'mcollective'
 include MCollective::RPC
 
 @force = false
+@extraopts = Hash.new()
 
 options = rpcoptions do |parser, options|
     parser.define_head "Manage remote puppet daemons"
@@ -17,10 +18,18 @@ options = rpcoptions do |parser, options|
     parser.separator ""
     parser.separator "Run Options"
 
-    parser.on("--force", "-f", "Force the puppet run to happen immediately without splay") do
+    parser.on("--force", "-f", "Force the puppet run to happen immediately without splay") do 
         @force = true
     end
+    parser.on("--noop", "-n", "Force either noop (true) or no-noop (false) mode") do |v|
+      @extraopts[:noop]=v
+    end
+    parser.on("--tags", "-t", "Specify tags for the puppet run") do |v|
+      @extraopts[:tags]=v
+    end
 end
+
+@extraopts[:force]=@force
 
 puppetd = rpcclient("puppetd", :options => options)
 
@@ -116,7 +125,7 @@ elsif command == "runall"
 
                 log("Running #{host}, concurrency is #{running}")
 
-                result = puppetd.custom_request("runonce", {:forcerun => true}, host, {"identity" => host})
+                result = puppetd.custom_request("runonce", @extraopts, host, {"identity" => host})
 
                 if result.is_a?(Array)
                     log("#{host} schedule status: #{result[0][:statusmsg]}")
@@ -140,7 +149,7 @@ elsif command == "summary"
     printrpcstats
 
 elsif command == "runonce"
-    printrpc puppetd.runonce(:forcerun => @force)
+    printrpc puppetd.runonce(@extraopts)
 
     printrpcstats
 
