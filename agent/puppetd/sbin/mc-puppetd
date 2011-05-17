@@ -21,10 +21,10 @@ options = rpcoptions do |parser, options|
     parser.on("--force", "-f", "Force the puppet run to happen immediately without splay") do 
         @force = true
     end
-    parser.on("--noop", "-n", "Force either noop (true) or no-noop (false) mode") do |v|
+    parser.on("--noop BOOLEAN", "-n", "Force either noop (true) or no-noop (false) mode") do |v|
       @extraopts[:noop]=v
     end
-    parser.on("--tags", "-t", "Specify tags for the puppet run") do |v|
+    parser.on("--tags TAG", "-t", "Specify tags for the puppet run") do |v|
       @extraopts[:tags]=v
     end
 end
@@ -127,7 +127,7 @@ elsif command == "runall"
 
                 result = puppetd.custom_request("runonce", @extraopts, host, {"identity" => host})
 
-                if result.is_a?(Array)
+                if result.is_a?(Array) and result[0].is_a?(MCollective::RPC::Result)
                     log("#{host} schedule status: #{result[0][:statusmsg]}")
                 else
                     log("#{host} unknown output: #{result.pretty_inspect}")
