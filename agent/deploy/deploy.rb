@@ -2,7 +2,9 @@ module MCollective
   module Agent
     class DeployPackage
         @@valid_actions=['query', 'has', 'add', 'refresh', 'remove','upgrade']
+      def initialize
         @search_path=''
+      end
       def valid_actions ; @@valid_actions ; end
       def do_validate(action)
        
@@ -52,19 +54,30 @@ module MCollective
     #Now we define our packages
     #class 
     class We7<DeployPackage
-      @search_path="/usr/local/tomcat-5.5.23/"
+      def initialize
+        @search_path="/usr/local/tomcat-5.5.23/"
+      end
     #valid actions in here
     end 
     class We7int<DeployPackage
-      @search_path="/var/cache/tomcat6"
+      def initialize
+        @search_path="/var/cache/tomcat6"
+      end
     end
     class Waif<DeployPackage
-      @search_path="/var/www/virtual/waif.we7c.net"
+      def initialize
+        @search_path="/var/www/virtual/waif.we7c.net"
+      end
     end
     class Assets<DeployPackage
-      @search_path="/var/www/tomcat/assets"
+      def initialize
+        @search_path="/var/www/tomcat/assets"
+      end
     end
     class Netlog<DeployPackage
+      def initialize
+        @search_path="var/www/virtual/nelog.devices.we7.com"
+      end
     end
 
     class Deploy<RPC::Agent
