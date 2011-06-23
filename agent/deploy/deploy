@@ -1,0 +1,360 @@
+#!/usr/bin/ruby
+# vim:ft=ruby:tw=80:
+# ------------------------------------------------------------------------------
+# deploy
+# We7 deployment script for website and associated assets
+#
+#   (c) 2011 onwards, Jonathan Wright <jonathan@we7.com>
+# ------------------------------------------------------------------------------
+# Changelog
+#   - 1.0 - Initial Release
+
+# We need access to the thread library so we can start up the tracker and the
+# seeder while running the main commands to the various boxes
+require 'thread'
+# We also need to process command-line arguments to find out what we're doing
+require 'optparse'
+# Make an update to OptionParser to improve it's handling of \n in text.
+class OptionParser
+  def separator(string)
+    string.split(/\n/).each do |line|
+      top.append(line.chomp, nil, nil)
+    end
+  end
+  alias text separator
+end
+# Don't forget base64 encoding for the .torrent file
+require 'base64'
+# And FileUtils to allow us to work with the filesystem
+require 'fileutils'
+# Plus all the bits for MCollective so we can issue the commands to the agents
+require 'mcollective'
+include MCollective::RPC
+# We would also like to colour output, helped by an override in the String class
+require 'term/ansicolor'
+class String
+  include Term::ANSIColor
+end
+
+# We're going to have a small override here; allow the NilClass to operate with
+# the empty? method from the String class so we don't need to do type checking.
+class NilClass
+  def empty?; nil?; end
+end
+
+
+# ------------------------------------------------------------------------------
+# Configure program variables and defaults
+$program = 'deploy'
+$version = '1.0'
+
+$opt = {
+  # General settings for the program which are configurable via the command-line
+  :debug       => false,
+  :filter      => true,
+  # MCollective RPC commands; these are the ones to be passed to all the
+  # machines to action and report back
+  :action      => nil,
+  :application => nil,
+  :version     => nil,
+  :pacakge     => nil,
+  # Also create stores for the base64 encoded data and the torrent file
+  :package64   => nil,
+  :torrent     => nil,
+  # We also may need a temporary directory
+  :tmp         => nil,
+  # Murder configuation
+  :tracker     => '127.0.0.1:8998',
+  :seeder      => nil,
+}
+
+# --------------)---------------------------------------------------------------
+# Program Functions
+def create_tmp
+  # Generate a set of characters we can use for the directory
+  chars = [('0'..'9'),('a'..'z'),('A'..'Z')].map{ |i| i.to_a }.flatten
+  25.times do
+    # We'll make up to 25 attempts, but generate a directory name with 10
+    # random characters in it and test to see if it's already in use. If
+    # so, skip to the next one,
+    tmp = '/tmp/deploy.' + 10.times.map{ chars[rand(chars.length)] }.join
+    next if File.directory?(tmp) or File.exists?(tmp)
+    # Otherwise create it and return what we've found
+    FileUtils.mkdir(tmp)
+    return tmp
+  end
+end
+
+def get_address(tracker)
+  # Begin by turning off reverse DNS lookup temporarily (even if it's off)
+  orig, Socket.do_not_reverse_lookup = Socket.do_not_reverse_lookup, true
+  # Create a UDP socket to the internal tracker and get the IP address
+  # the system will use to open that connection.
+  UDPSocket.open { |s| s.connect tracker, 1; s.addr.last }
+ensure
+  # Always ensure that the reverse DNS setting is restored
+  Socket.do_not_reverse_lookup = orig
+end
+
+# debug(_msg[, _thread])
+# This is one of our main methods and provides the method by which we can
+# output information on the general operation of the program. Of course, this is
+# configured so that it will only run if --debug has been provided at runtime.
+# _msg will be output to the screen, along with it's automatically determined
+# caller. If you would like the message to report in a thread, add _thread
+def debug(msg, thread = nil)
+  return nil unless $opt[:debug]
+  function = (thread ? "#{thread}." : '') + \
+    (caller[0][/`.*'/] ? caller[0][/`.*'/][1..-2].split(' ').last : 'core');
+  puts "#{function}#{(function.split(/\.([^.]*)$/).last == 'core' ? '' : '()')}: #{msg}".white
+end
+
+# ------------------------------------------------------------------------------
+# Process command-line arguments and prepare the program for running
+$opts = rpcoptions { |o,e|
+  o.banner = "Usage: #{$program} (application) [action]"
+  o.define_head "Deploy we7 Applications & Assets across our servers."
+  o.separator '  Available applications: we7classic, we7int, assets, waif, netlog'
+
+  o.separator 'Available Actions:'
+  # Generate options for each of the actions which can be performed against
+  # all the --application's
+  o.on('-?', '--query',
+       'List all versions currently installed?') do |has|
+    $opt[:action] = :query
+  end
+  o.on('--has (version)',
+       /^([a-zA-Z]{2}\/[0-9]{5,6}|r?[0-9]{5,6}|trunk|[0-9]+\.[0-9]+(\.[0-9]+)?)$/,
+       'Does the (version) exist/in use?') do |version|
+    $opt[:action] = :has; $opt[:version] = version
+  end
+  o.on('-a','--add (package)', String,
+       'Add (package) to the application.') do |package|
+    $opt[:action] = :add; $opt[:package] = package
+  end
+  o.on('--refresh (package)', String,
+       'Refresh the application with (package).') do |package|
+    $opt[:action] = :refresh; $opt[:package] = package
+  end
+  o.on('-u','--upgrade (package)', String,
+       'Upgrade the application with (package).') do |package|
+    $opt[:action] = :upgrade; $opt[:package] = package
+  end
+  o.on('--remove (version)',
+       /^([a-zA-Z]{2}\/[0-9]{5,6}|r?[0-9]{5,6}|trunk|[0-9]+\.[0-9]+(\.[0-9]+)?)$/,
+       'Remove (version) from the application.') do |version|
+    $opt[:action] = :remove; $opt[:version] = version
+  end
+
+  o.on('-d','--debug',  'Enable debugging output?')  { $opt[:debug]  = true  }
+  o.on('-l','--all',    'Run on all servers?')       { $opt[:filter] = false }
+}
+
+# In order to handle the different cases of arguments missing, etc., we need to
+# create subclasses of RuntimeError which we can raise as required.
+class OptionsError < RuntimeError; end
+class MissingApplication < OptionsError; end
+class MissingAction < OptionsError; end
+class InvalidApplication < OptionsError; end
+class NoAnApplication < OptionsError; end
+class InvalidPackage < OptionsError; end
+
+# Now we have defined what allowed arguments there are, parse the command-line
+# to get everything possible and then start validating that data as well.
+begin
+  # Abort if we don't have an application to work with, or that the application
+  # isn't one that can currently work with.
+  raise MissingApplication unless ARGV[0]
+  raise NotAnApplication unless [:we7classic,:we7int,:assets,:waif,:netlog].include?(ARGV[0].to_sym)
+  # It's available and in the list; save it to be sent to MCollective
+  $opt[:application] = ARGV[0].to_sym
+
+  # Next, check the actions to make sure we can run the action against the application
+  case $opt[:action]
+  when :query, :has, :upgrade, :refresh
+    true # These are available for any application
+  when :add, :remove
+    raise InvalidAppplication if [:we7classic,:we7int].include?($opt[:target])
+  else
+    raise MissingAction if $opt[:action].empty?
+  end
+
+  # Finally, perform a basic check on the package as well, making sure it exists
+  # and that it's either a gzip'ed or bzip'ed tar package or a zip file.
+  raise InvalidPackage \
+    unless not $opt[:package] or (File.exists?($opt[:package]) \
+       and /[a-zA-Z0-9_\-]+\.(t(ar\.)?(gz|bz2)|zip|war)$/.match($opt[:package]))
+
+# Handle anything which has gone wrong via OpetionParser as follows:
+rescue OptionParser::InvalidOption => e
+  puts "#{e.args.join(' ')} is/are invalid arguments."
+  exit 1
+rescue OptionParser::ParseError => e
+  puts "#{e.reason.capitalize} on the command-line".red + \
+    (e.args.empty? ? '' : " for #{e.args.join(' ')}".red)
+  exit 1
+rescue MissingApplication
+  puts "You need to set which application you are going to work with.".red
+  exit 1
+rescue NotAnApplication
+  puts "#{ARGV[0]} is not a valid application.".red
+  exit 1
+rescue MissingAction
+  puts "You haven't said what you would like to do.".red
+  exit 1
+rescue InvalidPackage
+  puts "Package #{$opt[:package]} is invalid and cannot be used; Aborting.".red
+  exit 1
+rescue InvalidTarget
+  puts "--#{$opt[:action]} cannot be used with #{$opt[:target]}".red
+  exit 1
+end
+
+puts "#{$program} v#{$version}"
+debug "Debugging enabled."
+
+# ------------------------------------------------------------------------------
+# Check the tracker is started
+debug "Skipping check of tracker; feature not implemented."
+
+# ------------------------------------------------------------------------------
+# If required, prepare the program for file transfer, including generating the
+# torrent file, base64 encoding it, and preparing the seed process.
+if $opt[:package]
+  # First, get a secure temporary directory we can work in
+  debug "Distribution of package required; creating temporary directory."
+  $opt[:tmp] = create_tmp()
+
+  # Then extract the name of the package and create the options required by
+  # murder_make_torrent to create the .torrent file we will distribute
+  $opt[:torrent] = "#{$opt[:tmp]}/#{File.basename($opt[:package]).split(/\.([^.]*)$/).first}.torrent"
+  debug "Creating #{$opt[:torrent]} for Murder."
+  # Now initiate the command to make the torrent
+  unless system("/usr/sbin/murder_make_torrent #{$opt[:package]} #{$opt[:tracker]} #{$opt[:torrent]}")
+    # If we cannot create the .torrent file, abort the program
+    puts "Failed to create the .torrent file:\n  #{$opt[:torrent]}\n" + \
+      "  from #{$opt[:package]}.".red
+    exit 2
+  end
+
+  # Next, generate a hash to store the information we need to send about the
+  # page (filename, the .torret file data and the tracker we need to connect to)
+  # and base64 encode it so it can be sent over MCollective to the agents
+  debug "Reading #{$opt[:torrent]} and generating seriaized data hash."
+  $opt[:package_hash] = Base64.encode64(Marshal.dump({
+    :package => File.basename($opt[:package]),
+    :tracker => $opt[:tracker],
+    :torrent => IO.read($opt[:torrent])
+  })).split(/\n/).join
+  debug " -> base64 encoding is #{$opt[:package_hash].length} bytes long."
+end
+
+# ------------------------------------------------------------------------------
+# Now we have set everything up, we can begin working with MCollective itself
+
+# Create a link with the deploy agent
+debug "Connecting with MCollective."
+mc = rpcclient('deploy', :options => $opts)
+
+# Select our target servers based on certain classes associted with the
+# configuration of the application we're installing
+if $opt[:filter]
+  case $opt[:application]
+  when :we7classic
+    debug "Adding filter for tomcat5 servers."
+    mc.class_filter /tomcat5/
+  when :we7int
+    debug "Adding filter for tomcat6 servers."
+    mc.class_filter /tomcat6/
+  when :assets
+    debug "Adding filter for lighttpd servers."
+    mc.class_filter /lighttpd::staticcontent/
+  when :waif, :netlog
+    debug "Adding filter for image servers."
+    mc.class_filter /we7-images/
+  end
+end
+
+# Let's do the discover now and find out where our requests are going to be sent
+puts "Initiating discover for applicable servers...".green
+mc.discover
+
+unless mc.stats.discovered > 0
+  puts "No servers found for #{$opt[:application]}; ".red + \
+    "cannot run //deploy/#{$opt[:action]}, aborting.".red
+  exit 0
+end
+
+# Initialise the thread now which will allow up to upload the file to all the
+# servers. This will be kept running until the RPC classes to MCollective
+# finish and therefore is no longer required.
+if $opt[:package]
+  $opt[:seeder] = Thread.new($opt[:package], $opt[:torrent]) { |package,torrent|
+    puts "Starting seed of package #{package} via #{$opt[:tracker]}.".green
+    debug " -> using local address: #{get_address($opt[:tracker].split(':',2).first)}.", 'seed'
+    system("/usr/sbin/murder_client seed #{torrent} #{package} #{get_address($opt[:tracker].split(':',2).first)}")
+    debug "Finished seeding of package #{package}; this should not be reached!", 'seed'
+  }
+  sleep(5) # We'll wait 3 this start up and connect with the tracker
+  $opt[:package] = File.basename($opt[:package])
+end
+
+# Let us know what is being sent
+print "Sending deploy/#{$opt[:application]}/#{$opt[:action]}".green
+[:package,:version].each { |o| print ":#{$opt[o]}".green if $opt[o] }
+puts "; please wait...".green
+
+# Now send the request to MCollective, adding all the details (we're not worried
+# if they're empty as they'll be skipped, plus it means less checking in the
+# agents to see if we have that value in the request).
+mc.send(
+  $opt[:action],
+  :application  =>  $opt[:application].to_s,
+  :version      => ($opt[:version] ? $opt[:version] : ''),
+  :package      => ($opt[:package] ? $opt[:package_hash] : '')
+).each do |a|
+  # Output the agent we have the reply from
+  printf(" -> %-25s ", a.results[:sender])
+  # Now output the message based on what statuscode we've been returned
+  case a.results[:statuscode]
+  when 0:
+    case $opt[:action]
+    when :query
+      puts "Found ".green + a.results[:data][:output].join(', ')
+    when :has
+      puts (a.results[:data][:output] ? 'Found'.green : 'Not Found'.yellow)
+    else
+      puts a.results[:data][:output].green
+    end
+  when 1:
+    puts a.results[:statusmsg].yellow
+  when 2,3,4,5:
+    puts a.results[:statusmsg].red
+  else
+    puts a.results[:statusmsg].dark
+  end
+end
+
+# Print out information about any servers which should have, but didn't respond
+# to the requests. This don't mean it didn't do the job, only that we don't know
+# what happened to the server
+unless mc.stats.noresponsefrom.empty?
+  puts "The following servers did not respond:".yellow
+  mc.stats.noresponsefrom.each do |server|
+    puts " -> " + server.yellow
+  end
+end
+
+# Print out the summary information and disconnect
+printrpcstats
+mc.disconnect
+
+# ------------------------------------------------------------------------------
+# With everything having run, it's now time to clean up after ourselves;
+# removing the temporary directory we've been working with and shutting down the
+# seeding thread (if one was created), but not in that order!
+puts "Cleaning up and shutting down...".green
+debug "Terminating seeding thread; no longer required."
+$opt[:seeder].exit if $opt[:seeder]
+debug "Removing #{$opt[:tmp]} directory."
+# FileUtils.rm_rf($opt[:tmp]) if $opt[:tmp]
