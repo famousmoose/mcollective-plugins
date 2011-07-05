@@ -196,8 +196,7 @@ module MCollective
           key = (package[-2,2] == 'gz' ? 'z' : 'j')
           raise DeployFail, "Unable to extract #{File.basename(package)} to #{location}" \
             unless system("/bin/tar #{key}xf --directory=#{location} #{package}")
-        when 'zip'
-          # FileUtils.mkdir_p(location) unless File.exists?(location)
+        when 'zip','war'
           begin
             # Open the .zip file and then extract each file to the location
             # required, making sure the directory exists first
@@ -212,9 +211,6 @@ module MCollective
           rescue => e
             raise DeployFail, "Could not unzip #{File.basename(package)} to #{location}: #{e}"
           end
-        when 'war'
-          # TODO: Not yet ready to 
-          raise DeployFail, "Not yet configured to extract .war files (#{package})"
         else
           # If the extension is anything else, we don't know how to extract it,
           # so we should abort before continuing.
@@ -245,22 +241,21 @@ module MCollective
             end
           end
         end
-        def warclean(path)
-          require 'fileutils'
-          target = '#{path}/webapps/ROOT/'
-          FileUtils.rm_rf(target)
-        end
-        def wardeploy(warfile, path)
-          #Clean up the webapp path and decompress our war file
-          require 'fileutils'
-          target = '#{path}/webapps/ROOT/'
-          warclean(path)
-
-          FileUtils.mkdir(target)
-          #Call out to unzip. Maybe we should use libzip instead?
-          system("unzip #{warfile} -d #{target}")
-        end
       end  
+      def catalinaClean(path)
+        require 'fileutils'
+        target = '#{path}/work/Catalina/localhost/'
+        FileUtils.rm_rf(target)
+      end
+      def warClean(path)
+        require 'fileutils'
+        target = '#{path}/webapps/ROOT/'
+        FileUtils.rm_rf(target)
+      end
+      def initdService(service, command)
+        return false unless ['stop','start','restart','status'].include?(command)
+        system("/etc/init.d/#{service} start")
+      end
     end
 
     # This is a local class which is used to raise errors with fetching the
@@ -272,6 +267,28 @@ module MCollective
       def initialize
         @search_path="/usr/local/tomcat-5.5.23/"
       end
+      def update
+      #Shutdown tomcat, clean out, redeploy and restart
+      #For full and Rolling deployments
+          tmp = create_tmp
+          package = get_package(tmp)
+          #Stop tomcat
+          initdService(:tomcat5, :stop)
+          #Cleanups
+          catalinaClean(@search_path)
+          warClean(@search_path)
+          extract(package,"#{@search_path}/webapps/ROOT/")
+          #Start tomcat again
+          initdService(:tomcat5, :start)
+      end
+      def refresh
+      #redeploy our webapp without deleting first
+      #This is for copy webpages
+          tmp = create_tmp
+          package = get_package(tmp)
+          #Might want to catalinaClean here?
+          extract(package,"#{@search_path}/webapps/ROOT/")
+      end
     #valid actions in here
     end 
     class We7int<DeployPackage
@@ -282,11 +299,6 @@ module MCollective
     class Waif<DeployPackage
       def initialize
         @search_path="/var/www/virtual/waif.we7c.net"
-      end
-    end
-    class Assets<DeployPackage
-      def initialize
-        @search_path="/var/www/tomcat/assets"
       end
     end
     class Netlog<DeployPackage
