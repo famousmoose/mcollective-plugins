@@ -21,7 +21,9 @@ require 'thread'
 require 'timeout'
 # We need these to extract files on the system
 require 'zip/zip'
-
+class NilClass
+  def empty?;nil?;end
+end
 module MCollective
   module Agent
     # This is the master class for deployment targets. It's used in a basic
@@ -194,8 +196,7 @@ module MCollective
         # so we'll export this
         when 'tar.gz','tar.bz2','tgz','tbz2'
           key = (package[-2,2] == 'gz' ? 'z' : 'j')
-          raise DeployFail, "Unable to extract #{File.basename(package)} to #{location}" \
-            unless system("/bin/tar #{key}xf --directory=#{location} #{package}")
+          raise DeployFail, "Unable to extract #{File.basename(package)} to #{location}" unless system("/bin/tar #{key}xf --directory=#{location} #{package}") 
         when 'zip','war'
           begin
             # Open the .zip file and then extract each file to the location
@@ -207,6 +208,7 @@ module MCollective
                 file.extract(to) unless File.exist?(to)
               end
             end
+          
           # If something goes wrong, catch it and re-raise a new exception
           rescue => e
             raise DeployFail, "Could not unzip #{File.basename(package)} to #{location}: #{e}"
@@ -219,29 +221,17 @@ module MCollective
         end
       end
 
-      def query
-      #Our query code is common, only the location changes
-        return false,"Unable to set search path" unless @search_path
-        if File.directory?(search_path + '/release')
-          Dir.entries(search_path + '/release').sort.each do |entry|
-            versions.push(entry) unless entry =~ /^\.+$/
-          end
-        end
-      # Depending on the software in questions, the trunk version of the files
-        # can be in one of two locations
-        ['', 'trunk/'].each do |base|
-          if File.exists?(search_path + base + '/.revision')
-            begin
-              File.open(search_path + base + '/.revision') do |file|
-                versions.push('trunk (' + file.gets.chomp +')')
-              end
-            rescue
-              # If we cannot get the revision from the file, just add 'trunk'
-              versions.push('trunk')
-            end
-          end
-        end
-      end  
+      def initdService(service, command)
+        return false unless ['stop','start','restart','status'].include?(command)
+        system("/etc/init.d/#{service} start")
+      end
+    end
+
+    # This is a local class which is used to raise errors with fetching the
+    # Packages and is used more as a symbol than any specific function.
+    class DeployFail<RuntimeError; end
+    # Our tomcat deployment code is basically common between all tomcat versions
+    class Tomcat<DeployPackage
       def catalinaClean(path)
         require 'fileutils'
         target = '#{path}/work/Catalina/localhost/'
@@ -252,34 +242,36 @@ module MCollective
         target = '#{path}/webapps/ROOT/'
         FileUtils.rm_rf(target)
       end
-      def initdService(service, command)
-        return false unless ['stop','start','restart','status'].include?(command)
-        system("/etc/init.d/#{service} start")
+      def tomcat_version ;end
+      def app_path; end
+      def has
+        version = nil
+        manifest = File.new('#{app_path}/webapps/ROOT/META-INF/MANIFEST.MF',:r)
+        begin
+          while (line = manifest.gets)
+            version = $1 if line.match(/^Implementation-Version: (.*)$/
+          end
+        rescue => err
+        ensure
+          manifest.close unless manifest.nil?
+        end
+        version
       end
-    end
 
-    # This is a local class which is used to raise errors with fetching the
-    # Packages and is used more as a symbol than any specific function.
-    class DeployFail<RuntimeError; end
-
-    # Create a Class which will handle the deployment of the we7 Classic website
-    class We7<DeployPackage
-      def initialize
-        @search_path="/usr/local/tomcat-5.5.23/"
-      end
-      def update
+      def upgrade
       #Shutdown tomcat, clean out, redeploy and restart
       #For full and Rolling deployments
           tmp = create_tmp
-          package = get_package(tmp)
+          #package = get_package(tmp)
+          package = ''
           #Stop tomcat
-          initdService(:tomcat5, :stop)
+          initdService(tomcat_version, :stop)
           #Cleanups
-          catalinaClean(@search_path)
-          warClean(@search_path)
-          extract(package,"#{@search_path}/webapps/ROOT/")
+          catalinaClean(app_path)
+          warClean(app_path)
+          extract(package,"#{app_path}/webapps/ROOT/")
           #Start tomcat again
-          initdService(:tomcat5, :start)
+          initdService(tomcat_version, :start)
       end
       def refresh
       #redeploy our webapp without deleting first
@@ -289,22 +281,32 @@ module MCollective
           #Might want to catalinaClean here?
           extract(package,"#{@search_path}/webapps/ROOT/")
       end
-    #valid actions in here
+    end
+    # Create a Class which will handle the deployment of the we7 Classic website
+    class We7<Tomcat
+        def app_path 
+          "/usr/local/tomcat-5.5.23/"
+        end
+        def tomcat_version
+          "tomcat5"
+        end
     end 
-    class We7int<DeployPackage
-      def initialize
-        @search_path="/var/cache/tomcat6"
+
+    class We7int<Tomcat
+      def app_path
+        "/var/cache/tomcat6"
+      end
+      def tomcat_version
+        "tomcat6"
       end
     end
+
     class Waif<DeployPackage
-      def initialize
-        @search_path="/var/www/virtual/waif.we7c.net"
-      end
+        @@app_path="/var/www/virtual/waif.we7c.net"
     end
+
     class Netlog<DeployPackage
-      def initialize
-        @search_path="var/www/virtual/nelog.devices.we7.com"
-      end
+        @@app_path="var/www/virtual/nelog.devices.we7.com"
     end
 
     # Create a Class which will handle the deployment (and management) of the
@@ -428,8 +430,8 @@ module MCollective
           package     = request[:package]
           # Make a note of what we're trying to do in this run
           logger.debug "Processing #{application}/#{act}" + \
-            (not version.nil? and version.class == String ? "; :version => '#{version}'" : '') + \
-            (not version.nil? and package.class == String ? "; :package => '#{package[0,10]}...'" : '')
+            (((not version.nil?) and (version.class == String)) ? "; :version => '#{version}'" : '') + \
+            (((not package.nil?) and (package.class == String)) ? "; :package => '#{package[0,10]}...'" : '')
           # Make sure that there's a class for this application's deployment
           reply.fail! "Application #{application} not available" \
             unless Agent.const_defined?(application.capitalize) \
